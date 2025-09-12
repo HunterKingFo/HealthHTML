@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>實驗室機台排程管理</title>
+<style>
+body{font-family:Arial,sans-serif;margin:0;padding:0;overflow:hidden;}
+#toolbar{display:flex;flex-wrap:wrap;gap:4px;padding:4px;background:#eee;}
+#toolbar button{padding:4px 8px;}
+#container{display:flex;height:calc(100vh - 40px);}/* toolbar approx */
+.view{flex:1;overflow:auto;position:relative;}
+#boardView{display:none;}
+.machine-row{display:flex;align-items:center;border-bottom:1px solid #ccc;position:relative;height:60px;}
+.machine-label{width:100px;flex-shrink:0;padding:4px;box-sizing:border-box;border-right:1px solid #ccc;}
+.timeline{flex:1;position:relative;height:100%;}
+.schedule-bar{position:absolute;height:40px;border-radius:4px;color:#fff;padding:2px;cursor:pointer;box-sizing:border-box;}
+.schedule-bar.selected{outline:3px solid #000;}
+.gantt-grid{position:absolute;top:0;left:0;height:100%;pointer-events:none;}
+.gantt-grid div{position:absolute;border-left:1px solid #eee;color:#999;font-size:10px;top:0;bottom:0;}
+.now-line{position:absolute;top:0;bottom:0;width:2px;background:red;pointer-events:none;}
+/* Board */
+.board-list{display:flex;flex-direction:column;width:300px;border-right:1px solid #ccc;overflow:auto;}
+.board-list-header{background:#ddd;padding:4px;font-weight:bold;flex-shrink:0;}
+.card{background:#888;color:#fff;margin:4px;padding:4px;border-radius:4px;cursor:move;}
+.card.selected{outline:3px solid #000;}
+#sidePanel{position:absolute;right:0;top:40px;bottom:0;width:220px;border-left:1px solid #ccc;background:#f7f7f7;padding:8px;overflow:auto;}
+#sidePanel.hidden{display:none;}
+#modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;}
+#modal.hidden{display:none;}
+#modal form{background:#fff;padding:20px;border-radius:4px;display:flex;flex-direction:column;gap:8px;}
+#modal input,#modal select,#modal textarea{width:200px;}
+</style>
+</head>
+<body>
+<div id="toolbar">
+<button id="ganttBtn">Gantt</button>
+<button id="boardBtn">Board</button>
+<button id="addMachineBtn">新增機台</button>
+<button id="addScheduleBtn">新增排程</button>
+<input id="searchBox" placeholder="搜尋..."/>
+<button id="exportBtn">匯出</button>
+<input type="file" id="importFile" style="display:none"/>
+<button id="importBtn">匯入</button>
+<button id="resetBtn">重置範例</button>
+<button id="clearBtn">清空</button>
+</div>
+<div id="container">
+<div id="ganttView" class="view"></div>
+<div id="boardView" class="view"></div>
+</div>
+<div id="sidePanel" class="hidden"></div>
+<div id="modal" class="hidden"></div>
+<script>
+/* ================= 資料層 ================= */
+const DataStore=(()=>{
+  const KEY='labSchedulerDataV1';
+  let state={machines:[],schedules:[],view:'gantt',zoomLevel:'day'};
+  function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+  function load(){const raw=localStorage.getItem(KEY);if(raw)state=JSON.parse(raw);else{state=example();save();}}
+  function example(){
+    const today=new Date();
+    const machines=[
+      {id:'m1',name:'機台A',color:'#e74c3c',order:0},
+      {id:'m2',name:'機台B',color:'#27ae60',order:1},
+      {id:'m3',name:'機台C',color:'#2980b9',order:2},
+    ];
+    const schedules=[];let c=1;
+    machines.forEach((m,mi)=>{
+      for(let i=0;i<3;i++){
+        const start=new Date(today.getFullYear(),today.getMonth(),today.getDate()+mi,8+i*2);
+        const end=new Date(start.getTime()+90*60*1000);
+        schedules.push({id:'s'+c,machineId:m.id,expId:'E'+c,owner:'U'+i,start:start.toISOString(),end:end.toISOString(),color:m.color});
+        c++;
+      }
+    });
+    return{machines,schedules,view:'gantt',zoomLevel:'day'};
+  }
+  load();
+  return{
+    state:()=>state,
+    set:v=>{Object.assign(state,v);save();},
+    addMachine:m=>{state.machines.push(m);save();},
+    removeMachine:id=>{state.machines=state.machines.filter(m=>m.id!==id);state.schedules=state.schedules.filter(s=>s.machineId!==id);save();},
+    addSchedule:s=>{state.schedules.push(s);save();},
+    updateSchedule:(id,data)=>{Object.assign(state.schedules.find(s=>s.id===id),data);save();},
+    removeSchedule:id=>{state.schedules=state.schedules.filter(s=>s.id!==id);save();},
+    replaceAll:s=>{state=s;save();},
+    example
+  };
+})();
+
+/* ================= 工具與邏輯 ================= */
+const Logic=(()=>{
+  const uid=()=> 'id'+Math.random().toString(36).slice(2,9);
+  const toDate=str=>new Date(str);
+  const fmt=d=>d.toISOString().slice(0,16);
+  const dur=s=>toDate(s.end)-toDate(s.start);
+  const overlap=(s,others)=>others.some(o=>!(toDate(s.end)<=toDate(o.start)||toDate(s.start)>=toDate(o.end)));
+  function pushForward(s,list){
+    let start=toDate(s.start),end=toDate(s.end),len=end-start;
+    const arr=list.filter(o=>o.id!==s.id).sort((a,b)=>toDate(a.start)-toDate(b.start));
+    for(const o of arr){
+      const os=toDate(o.start),oe=toDate(o.end);
+      if(!(end<=os||start>=oe)){start=new Date(oe);end=new Date(start.getTime()+len);}
+    }
+    s.start=start.toISOString();s.end=end.toISOString();
+  }
+  function recalcBoard(mid){
+    const st=DataStore.state();
+    const list=st.schedules.filter(s=>s.machineId===mid).sort((a,b)=>toDate(a.start)-toDate(b.start));
+    for(let i=1;i<list.length;i++){
+      const prev=list[i-1],cur=list[i];
+      const len=dur(cur);
+      const start=new Date(toDate(prev.end));
+      const end=new Date(start.getTime()+len);
+      cur.start=start.toISOString();cur.end=end.toISOString();
+    }
+  }
+  return{uid,toDate,fmt,dur,overlap,pushForward,recalcBoard};
+})();
+
+/* ================= 全域狀態 ================= */
+let selectedId=null;let filterTerm='';
+function selectSchedule(id){selectedId=id;const s=DataStore.state().schedules.find(x=>x.id===id);SidePanel.show(s);render();}
+
+/* ================= Gantt View ================= */
+const GanttView=(()=>{
+  const el=document.getElementById('ganttView');
+  let startTime=new Date();
+  function scale(){const z=DataStore.state().zoomLevel;return z==='hour'?40:z==='day'?10:2;}
+  function render(){
+    const st=DataStore.state();el.innerHTML='';
+    const times=st.schedules.map(s=>Logic.toDate(s.start));
+    startTime=times.length?new Date(Math.min(...times)):new Date();startTime.setHours(0,0,0,0);
+    st.machines.sort((a,b)=>a.order-b.order).forEach(m=>{
+      const row=document.createElement('div');row.className='machine-row';
+      const label=document.createElement('div');label.className='machine-label';label.textContent=m.name;label.style.background=m.color+'22';row.appendChild(label);
+      const tl=document.createElement('div');tl.className='timeline';row.appendChild(tl);el.appendChild(row);
+    });
+    drawBars();drawGrid();drawNow();
+    el.addEventListener('wheel',zoomHandler);
+  }
+  function drawGrid(){const sc=scale();const grid=document.createElement('div');grid.className='gantt-grid';const hours=24*7;for(let i=0;i<=hours;i++){const x=i*sc;const line=document.createElement('div');line.style.left=x+'px';if(i%24===0)line.textContent=i/24+'d';grid.appendChild(line);}el.appendChild(grid);}
+  function drawNow(){const sc=scale();const now=new Date();const diff=(now-startTime)/3600000*sc;const line=document.createElement('div');line.className='now-line';line.style.left=diff+'px';el.appendChild(line);}
+  function drawBars(){const st=DataStore.state();const sc=scale();st.schedules.filter(s=>!filterTerm||matchFilter(s)).forEach(s=>{const row=[...el.getElementsByClassName('machine-row')][st.machines.sort((a,b)=>a.order-b.order).findIndex(m=>m.id===s.machineId)];const tl=row.querySelector('.timeline');const bar=document.createElement('div');bar.className='schedule-bar';if(s.id===selectedId)bar.classList.add('selected');bar.dataset.id=s.id;bar.textContent=s.expId+'-'+s.owner;bar.style.background=s.color||'#777';const start=Logic.toDate(s.start),end=Logic.toDate(s.end);const left=(start-startTime)/3600000*sc;width=(end-start)/3600000*sc;bar.style.left=left+'px';bar.style.width=width+'px';tl.appendChild(bar);});
+  }
+  function zoomHandler(e){if(e.altKey){e.preventDefault();const z=['hour','day','week'];let idx=z.indexOf(DataStore.state().zoomLevel);idx+=e.deltaY<0?-1:1;if(idx<0)idx=0;if(idx>2)idx=2;DataStore.set({zoomLevel:z[idx]});render();}}
+  // drag move
+  el.addEventListener('pointerdown',e=>{const bar=e.target.closest('.schedule-bar');if(!bar)return;bar.setPointerCapture(e.pointerId);const id=bar.dataset.id;const s=DataStore.state().schedules.find(x=>x.id===id);const sc=scale();const startX=e.clientX;const origStart=Logic.toDate(s.start);const origEnd=Logic.toDate(s.end);function move(ev){const dx=ev.clientX-startX;const hours=dx/sc;const start=new Date(origStart.getTime()+hours*3600000);const end=new Date(origEnd.getTime()+hours*3600000);bar.style.left=(start-startTime)/3600000*sc+'px';bar.style.width=(end-start)/3600000*sc+'px';}
+  function up(ev){bar.releasePointerCapture(ev.pointerId);const dx=ev.clientX-startX;const hours=dx/sc;const start=new Date(origStart.getTime()+hours*3600000);const end=new Date(origEnd.getTime()+hours*3600000);s.start=start.toISOString();s.end=end.toISOString();Logic.pushForward(s,DataStore.state().schedules.filter(x=>x.machineId===s.machineId));DataStore.set({});render();el.removeEventListener('pointermove',move);el.removeEventListener('pointerup',up);}el.addEventListener('pointermove',move);el.addEventListener('pointerup',up);});
+  // click & dblclick
+  el.addEventListener('click',e=>{const bar=e.target.closest('.schedule-bar');if(bar)selectSchedule(bar.dataset.id);});
+  el.addEventListener('dblclick',e=>{const bar=e.target.closest('.schedule-bar');if(bar){e.stopPropagation();openScheduleForm(DataStore.state().schedules.find(s=>s.id===bar.dataset.id));}});
+  return{render};
+})();
+
+/* ================= Board View ================= */
+const BoardView=(()=>{
+  const el=document.getElementById('boardView');
+  function render(){const st=DataStore.state();el.innerHTML='';st.machines.sort((a,b)=>a.order-b.order).forEach(m=>{const list=document.createElement('div');list.className='board-list';list.dataset.mid=m.id;const header=document.createElement('div');header.className='board-list-header';header.textContent=m.name;header.style.background=m.color+'55';list.appendChild(header);st.schedules.filter(s=>s.machineId===m.id).sort((a,b)=>Logic.toDate(a.start)-Logic.toDate(b.start)).filter(s=>!filterTerm||matchFilter(s)).forEach(s=>{const card=document.createElement('div');card.className='card';card.draggable=true;card.dataset.id=s.id;if(s.id===selectedId)card.classList.add('selected');card.textContent=s.expId+'\n'+s.owner;card.style.background=s.color||'#888';list.appendChild(card);});el.appendChild(list);});attachDrag();}
+  function attachDrag(){el.querySelectorAll('.card').forEach(c=>{c.addEventListener('dragstart',e=>{e.dataTransfer.setData('text/plain',c.dataset.id);});c.addEventListener('click',()=>selectSchedule(c.dataset.id));c.addEventListener('dblclick',()=>openScheduleForm(DataStore.state().schedules.find(s=>s.id===c.dataset.id)));});el.querySelectorAll('.board-list').forEach(list=>{list.addEventListener('dragover',e=>e.preventDefault());list.addEventListener('drop',e=>{e.preventDefault();const id=e.dataTransfer.getData('text/plain');const card=el.querySelector(`[data-id="${id}"]`);if(e.target.classList.contains('card')){e.target.before(card);}else{list.appendChild(card);}updateFromDOM(list);});});}
+  function updateFromDOM(list){const ids=[...list.querySelectorAll('.card')].map(c=>c.dataset.id);const st=DataStore.state();let schedules=ids.map(id=>st.schedules.find(s=>s.id===id));schedules.forEach(s=>s.machineId=list.dataset.mid);const base=Logic.toDate(schedules[0].start);for(let i=1;i<schedules.length;i++){const prev=schedules[i-1],cur=schedules[i];const len=Logic.dur(cur);const start=new Date(Logic.toDate(prev.end));const end=new Date(start.getTime()+len);cur.start=start.toISOString();cur.end=end.toISOString();}DataStore.set({});render();}
+  return{render};
+})();
+
+/* ================= 對話框 ================= */
+function openScheduleForm(sch){const modal=document.getElementById('modal');modal.innerHTML='';const form=document.createElement('form');form.innerHTML=`<label>機台<select name="machineId"></select></label><label>實驗單號<input name="expId" required></label><label>人員<input name="owner" required></label><label>開始<input type="datetime-local" name="start" required></label><label>結束<input type="datetime-local" name="end" required></label><label>顏色<input type="color" name="color"></label><label>備註<textarea name="remark"></textarea></label><div style="text-align:right"><button type="submit">儲存</button><button type="button" id="cancel">取消</button></div>`;const st=DataStore.state();const sel=form.querySelector('select');st.machines.forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.name;sel.appendChild(o);});if(sch){form.machineId.value=sch.machineId;form.expId.value=sch.expId;form.owner.value=sch.owner;form.start.value=Logic.fmt(Logic.toDate(sch.start));form.end.value=Logic.fmt(Logic.toDate(sch.end));form.color.value=sch.color||'#888';form.remark.value=sch.remark||'';}form.addEventListener('submit',e=>{e.preventDefault();if(new Date(form.end.value)<=new Date(form.start.value)){alert('結束時間必須大於開始');return;}if(sch){DataStore.updateSchedule(sch.id,{machineId:form.machineId.value,expId:form.expId.value,owner:form.owner.value,start:new Date(form.start.value).toISOString(),end:new Date(form.end.value).toISOString(),color:form.color.value,remark:form.remark.value});Logic.pushForward(DataStore.state().schedules.find(x=>x.id===sch.id),DataStore.state().schedules.filter(x=>x.machineId===form.machineId.value));}else{const id=Logic.uid();const s={id,machineId:form.machineId.value,expId:form.expId.value,owner:form.owner.value,start:new Date(form.start.value).toISOString(),end:new Date(form.end.value).toISOString(),color:form.color.value,remark:form.remark.value};const list=DataStore.state().schedules.filter(x=>x.machineId===s.machineId);if(Logic.overlap(s,list))Logic.pushForward(s,list);DataStore.addSchedule(s);}modal.classList.add('hidden');render();});modal.appendChild(form);modal.classList.remove('hidden');form.querySelector('#cancel').onclick=()=>modal.classList.add('hidden');}
+
+/* ================= 側邊欄 ================= */
+const SidePanel=(()=>{const el=document.getElementById('sidePanel');function show(s){if(!s){el.classList.add('hidden');el.innerHTML='';return;}el.classList.remove('hidden');el.innerHTML=`<h3>排程</h3><p>ID:${s.id}</p><p>機台:${s.machineId}</p><p>exp:${s.expId}</p><p>人員:${s.owner}</p><p>${s.start}<br>${s.end}</p><button id="edit">編輯</button><button id="del">刪除</button>`;el.querySelector('#edit').onclick=()=>openScheduleForm(s);el.querySelector('#del').onclick=()=>{if(confirm('刪除?')){DataStore.removeSchedule(s.id);selectSchedule(null);render();}};}return{show};})();
+
+/* ================= 主渲染與工具列 ================= */
+function matchFilter(s){const st=DataStore.state();const m=st.machines.find(x=>x.id===s.machineId);const t=(s.expId+s.owner+(m?m.name:''))?.toLowerCase();return t.includes(filterTerm.toLowerCase());}
+function render(){const st=DataStore.state();if(st.view==='gantt'){document.getElementById('ganttView').style.display='block';document.getElementById('boardView').style.display='none';GanttView.render();}else{document.getElementById('ganttView').style.display='none';document.getElementById('boardView').style.display='flex';BoardView.render();}}
+// toolbar
+const tb={ganttBtn:'gantt',boardBtn:'board'};for(const id in tb){document.getElementById(id).onclick=()=>{DataStore.set({view:tb[id]});render();};}
+document.getElementById('addMachineBtn').onclick=()=>{const name=prompt('機台名稱?');if(name){const color=prompt('顏色HEX','#cccccc');DataStore.addMachine({id:Logic.uid(),name,color,order:DataStore.state().machines.length});render();}};
+document.getElementById('addScheduleBtn').onclick=()=>openScheduleForm();
+document.getElementById('exportBtn').onclick=()=>{const data=JSON.stringify(DataStore.state());const blob=new Blob([data],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='schedules.json';a.click();};
+document.getElementById('importBtn').onclick=()=>document.getElementById('importFile').click();
+document.getElementById('importFile').onchange=e=>{const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=()=>{try{const data=JSON.parse(r.result);DataStore.replaceAll(data);render();}catch(err){alert('JSON錯誤');}};r.readAsText(file);};
+document.getElementById('resetBtn').onclick=()=>{if(confirm('重置?')){DataStore.replaceAll(DataStore.example());render();}};
+document.getElementById('clearBtn').onclick=()=>{if(confirm('清空?')){DataStore.replaceAll({machines:[],schedules:[],view:'gantt',zoomLevel:'day'});render();}};
+document.getElementById('searchBox').oninput=e=>{filterTerm=e.target.value;render();};
+
+render();
+</script>
+</body>
+</html>
